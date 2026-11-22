@@ -1,7 +1,7 @@
+import math
 import streamlit as st
 import pandas as pd
 import numpy as np
-from scipy.stats import poisson
 import plotly.express as px
 import plotly.graph_objects as go
 
@@ -24,6 +24,12 @@ TEMPORADAS = {
 }
 
 
+def poisson_pmf(k: int, lam: float) -> float:
+    if lam <= 0:
+        return 1.0 if k == 0 else 0.0
+    return (lam ** k) * math.exp(-lam) / math.factorial(k)
+
+
 @st.cache_data(ttl=3600)
 def cargar_datos_historicos(codigo_liga: str, codigos_temp: list[str]) -> pd.DataFrame:
     frames = []
@@ -38,7 +44,10 @@ def cargar_datos_historicos(codigo_liga: str, codigos_temp: list[str]) -> pd.Dat
     if not frames:
         return pd.DataFrame()
     data = pd.concat(frames, ignore_index=True)
-    cols_base = ["Temporada", "Date", "HomeTeam", "AwayTeam", "FTHG", "FTAG", "FTR", "HS", "AS", "HST", "AST", "HC", "AC"]
+    cols_base = [
+        "Temporada", "Date", "HomeTeam", "AwayTeam",
+        "FTHG", "FTAG", "FTR", "HS", "AS", "HST", "AST", "HC", "AC",
+    ]
     cols_disponibles = [c for c in cols_base if c in data.columns]
     data = data[cols_disponibles].dropna(subset=["HomeTeam", "AwayTeam", "FTHG", "FTAG"])
     data["Date"] = pd.to_datetime(data["Date"], dayfirst=True, errors="coerce")
@@ -63,8 +72,8 @@ def calcular_metricas_poisson(df: pd.DataFrame, local: str, visita: str):
 
     max_goles = 7
     matriz = np.outer(
-        [poisson.pmf(i, lambda_local) for i in range(max_goles)],
-        [poisson.pmf(j, lambda_visita) for j in range(max_goles)],
+        [poisson_pmf(i, lambda_local) for i in range(max_goles)],
+        [poisson_pmf(j, lambda_visita) for j in range(max_goles)],
     )
     prob_1 = np.tril(matriz, -1).sum()
     prob_x = np.trace(matriz)
@@ -81,7 +90,7 @@ with st.sidebar:
     temps_sel = st.multiselect(
         "Temporadas a incluir",
         list(TEMPORADAS.keys()),
-        default=["2025/2026", "2024/2025"],
+        default=["2026/2027", "2025/2026"],
     )
 
 if not temps_sel:
