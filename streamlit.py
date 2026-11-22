@@ -2,103 +2,143 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 from scipy.stats import poisson
-import requests
+import plotly.express as px
+import plotly.graph_objects as go
 
-# Configuración inicial de la app
-st.set_page_config(page_title="Analizador de Apuestas Pro", layout="wide")
+st.set_page_config(page_title="Football Historical Analytics", layout="wide")
 
-# 1. INTEGRACIÓN DE API Y BASE DE DATOS
-def obtener_datos_api(api_key, liga):
-    """
-    Aquí conectas tu proveedor (ej. API-Football). 
-    Retornamos datos simulados con estadísticas avanzadas para que el script funcione.
-    """
-    # En producción: response = requests.get(f"URL_DE_TU_API/{liga}", headers={"key": api_key})
-    datos_simulados = {
-        'Equipo': ['Local FC', 'Visitante United'],
-        'Goles_Promedio': [1.8, 1.2],
-        'xG_Promedio': [2.1, 1.0], # Goles esperados
-        'Tiros_Puerta_Promedio': [6.5, 3.2],
-        'Fuerza_Defensiva': [0.8, 1.3] # Menor es mejor
-    }
-    return pd.DataFrame(datos_simulados)
+LIGAS = {
+    "Premier League (Inglaterra)": "E0",
+    "LaLiga (España)": "SP1",
+    "Serie A (Italia)": "I1",
+    "Bundesliga (Alemania)": "D1",
+    "Ligue 1 (Francia)": "F1",
+}
 
-# Inicializar estado para no perder datos al cambiar de mercado
-if 'datos_liga' not in st.session_state:
-    st.session_state.datos_liga = None
+TEMPORADAS = {
+    "2026/2027": "2627",
+    "2025/2026": "2526",
+    "2024/2025": "2425",
+    "2023/2024": "2324",
+    "2022/2023": "2223",
+}
 
-# 2. MOTOR MATEMÁTICO: POISSON CON DATA AVANZADA
-def calcular_fuerza_ajustada(xg, tiros, goles, es_local=False):
-    # Ponderación para crear una "Fuerza Ofensiva Real"
-    fuerza = (xg * 0.5) + (goles * 0.3) + (tiros * 0.05)
-    if es_local:
-        fuerza = fuerza * 1.15 # Factor de Fuerza de Localía (Home Advantage)
-    return fuerza
 
-def matriz_poisson(lambda_local, lambda_visitante, max_goles=6):
-    # Genera la matriz de probabilidades de todos los resultados posibles (0-0, 1-0, 2-1, etc.)
-    prob_local = [poisson.pmf(i, lambda_local) for i in range(max_goles)]
-    prob_visitante = [poisson.pmf(i, lambda_visitante) for i in range(max_goles)]
-    matriz = np.outer(prob_local, prob_visitante)
-    return matriz
+@st.cache_data(ttl=3600)
+def cargar_datos_historicos(codigo_liga: str, codigos_temp: list[str]) -> pd.DataFrame:
+    frames = []
+    for temp in codigos_temp:
+        url = f"https://www.football-data.co.uk/mmz4281/{temp}/{codigo_liga}.csv"
+        try:
+            df = pd.read_csv(url, encoding="latin1")
+            df["Temporada"] = f"20{temp[:2]}/20{temp[2:]}"
+            frames.append(df)
+        except Exception:
+            continue
+    if not frames:
+        return pd.DataFrame()
+    data = pd.concat(frames, ignore_index=True)
+    cols_base = ["Temporada", "Date", "HomeTeam", "AwayTeam", "FTHG", "FTAG", "FTR", "HS", "AS", "HST", "AST", "HC", "AC"]
+    cols_disponibles = [c for c in cols_base if c in data.columns]
+    data = data[cols_disponibles].dropna(subset=["HomeTeam", "AwayTeam", "FTHG", "FTAG"])
+    data["Date"] = pd.to_datetime(data["Date"], dayfirst=True, errors="coerce")
+    return data.sort_values("Date", ascending=False)
 
-# 3. INTERFAZ Y MERCADOS
-st.title("⚽ Analizador Algorítmico de Fútbol")
 
-# Panel lateral: Configuración y API
+def calcular_metricas_poisson(df: pd.DataFrame, local: str, visita: str):
+    media_goles_local = df["FTHG"].mean()
+    media_goles_visita = df["FTAG"].mean()
+
+    df_local = df[df["HomeTeam"] == local]
+    df_visita = df[df["AwayTeam"] == visita]
+
+    ataque_local = (df_local["FTHG"].mean() / media_goles_local) if len(df_local) else 1.0
+    defensa_local = (df_local["FTAG"].mean() / media_goles_visita) if len(df_local) else 1.0
+
+    ataque_visita = (df_visita["FTAG"].mean() / media_goles_visita) if len(df_visita) else 1.0
+    defensa_visita = (df_visita["FTHG"].mean() / media_goles_local) if len(df_visita) else 1.0
+
+    lambda_local = ataque_local * defensa_visita * media_goles_local
+    lambda_visita = ataque_visita * defensa_local * media_goles_visita
+
+    max_goles = 7
+    matriz = np.outer(
+        [poisson.pmf(i, lambda_local) for i in range(max_goles)],
+        [poisson.pmf(j, lambda_visita) for j in range(max_goles)],
+    )
+    prob_1 = np.tril(matriz, -1).sum()
+    prob_x = np.trace(matriz)
+    prob_2 = np.triu(matriz, 1).sum()
+
+    return lambda_local, lambda_visita, prob_1, prob_x, prob_2, matriz
+
+
+st.title("Panel de Análisis Histórico de Fútbol")
+
 with st.sidebar:
-    st.header("Configuración de Datos")
-    api_key_input = st.text_input("Ingresa tu API Key (Opcional por ahora)", type="password")
-    if st.button("Cargar Base de Datos"):
-        st.session_state.datos_liga = obtener_datos_api(api_key_input, "Premier League")
-        st.success("Datos cargados en memoria.")
+    st.header("Filtros Históricos")
+    liga_nombre = st.selectbox("Competición", list(LIGAS.keys()))
+    temps_sel = st.multiselect(
+        "Temporadas a incluir",
+        list(TEMPORADAS.keys()),
+        default=["2025/2026", "2024/2025"],
+    )
 
-if st.session_state.datos_liga is not None:
-    # Simulación de extracción de métricas del dataframe
-    lambda_loc = calcular_fuerza_ajustada(2.1, 6.5, 1.8, es_local=True)
-    lambda_vis = calcular_fuerza_ajustada(1.0, 3.2, 1.2, es_local=False)
-    
-    matriz = matriz_poisson(lambda_loc, lambda_vis)
-    
-    # Cálculos de Mercados extrayendo áreas de la matriz
-    prob_local = np.sum(np.tril(matriz, -1))
-    prob_empate = np.sum(np.diag(matriz))
-    prob_visitante = np.sum(np.triu(matriz, 1))
-    
-    prob_over_25 = 1 - np.sum(matriz[np.triu_indices_from(matriz)] * (np.add.outer(np.arange(6), np.arange(6)) <= 2)[np.triu_indices_from(matriz)])
-    
-    # Pestañas para cambiar de mercado sin perder contexto
-    tab1, tab2, tab3 = st.tabs(["1X2 (Match Odds)", "Over/Under", "Asistente IA"])
-    
-    with tab1:
-        st.subheader("Mercado 1X2")
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Gana Local", f"{prob_local*100:.1f}%")
-        col2.metric("Empate", f"{prob_empate*100:.1f}%")
-        col3.metric("Gana Visitante", f"{prob_visitante*100:.1f}%")
-        
-        st.markdown("### Valor Esperado (EV)")
-        cuota_casa = st.number_input("Cuota que ofrece la casa de apuestas (Local)", value=2.0)
-        ev = (prob_local * cuota_casa) - 1
-        st.success(f"EV para el Local: {ev*100:.2f}%") if ev > 0 else st.error(f"EV Negativo: {ev*100:.2f}%")
+if not temps_sel:
+    st.warning("Selecciona al menos una temporada en el panel lateral.")
+    st.stop()
 
-    with tab2:
-        st.subheader("Mercado de Goles Totales")
-        st.metric("Probabilidad Over 2.5 Goles", f"{prob_over_25*100:.1f}%")
-        st.metric("Probabilidad Under 2.5 Goles", f"{(1-prob_over_25)*100:.1f}%")
+df_hist = cargar_datos_historicos(LIGAS[liga_nombre], [TEMPORADAS[t] for t in temps_sel])
 
-    with tab3:
-        st.subheader("Generador de Prompt para Gemini")
-        prompt_generado = f"""
-        Actúa como un analista experto de fútbol. Basado en el siguiente modelo de Poisson ajustado por xG y fuerza de localía:
-        - Probabilidad Local: {prob_local*100:.1f}%
-        - Probabilidad Empate: {prob_empate*100:.1f}%
-        - Probabilidad Visitante: {prob_visitante*100:.1f}%
-        - Goles Esperados (xG) Local: 2.1 | Visitante: 1.0
-        
-        Sabiendo que la casa de apuestas paga una cuota de {cuota_casa} por el Local. ¿Crees que el riesgo justifica la apuesta según la varianza típica de este deporte?
-        """
-        st.text_area("Copia este texto y pégalo en nuestro chat para un análisis profundo:", value=prompt_generado, height=200)
+if df_hist.empty:
+    st.error("No se pudieron recuperar datos para la combinación seleccionada.")
+    st.stop()
 
-else:
-    st.info("Carga la base de datos en el menú lateral para comenzar el análisis.")
+equipos = sorted(df_hist["HomeTeam"].unique())
+col1, col2 = st.columns(2)
+equipo_local = col1.selectbox("Equipo Local", equipos, index=0)
+equipo_visita = col2.selectbox("Equipo Visitante", equipos, index=min(1, len(equipos) - 1))
+
+lam_l, lam_v, p1, px_prob, p2, matriz_prob = calcular_metricas_poisson(df_hist, equipo_local, equipo_visita)
+
+m1, m2, m3, m4, m5 = st.columns(5)
+m1.metric("Goles Esperados Local (λ)", f"{lam_l:.2f}")
+m2.metric("Goles Esperados Visita (λ)", f"{lam_v:.2f}")
+m3.metric("Prob. Victoria Local", f"{p1*100:.1f}%")
+m4.metric("Prob. Empate", f"{px_prob*100:.1f}%")
+m5.metric("Prob. Victoria Visita", f"{p2*100:.1f}%")
+
+tab1, tab2, tab3 = st.tabs(["Matriz de Marcadores", "Historial Directo (H2H)", "Tendencia de Goles"])
+
+with tab1:
+    fig_heat = go.Figure(
+        data=go.Heatmap(
+            z=matriz_prob * 100,
+            x=[f"Visita {i}" for i in range(7)],
+            y=[f"Local {i}" for i in range(7)],
+            text=np.round(matriz_prob * 100, 1),
+            texttemplate="%{text}%",
+            colorscale="Blues",
+        )
+    )
+    fig_heat.update_layout(title="Probabilidad de Marcador Exacto (%)", height=450)
+    st.plotly_chart(fig_heat, use_container_width=True)
+
+with tab2:
+    h2h = df_hist[
+        ((df_hist["HomeTeam"] == equipo_local) & (df_hist["AwayTeam"] == equipo_visita))
+        | ((df_hist["HomeTeam"] == equipo_visita) & (df_hist["AwayTeam"] == equipo_local))
+    ]
+    st.dataframe(h2h, use_container_width=True, hide_index=True)
+
+with tab3:
+    ultimos = df_hist[(df_hist["HomeTeam"] == equipo_local) | (df_hist["AwayTeam"] == equipo_local)].head(15).copy()
+    ultimos["Goles_Equipo"] = np.where(ultimos["HomeTeam"] == equipo_local, ultimos["FTHG"], ultimos["FTAG"])
+    fig_line = px.bar(
+        ultimos.sort_values("Date"),
+        x="Date",
+        y="Goles_Equipo",
+        color="Temporada",
+        title=f"Últimos 15 partidos de {equipo_local} (Goles anotados)",
+    )
+    st.plotly_chart(fig_line, use_container_width=True)
